@@ -140,7 +140,7 @@ static void fast_buf_clear(void)
 }
 
 /* Workqueue handler: executed by a kernel thread */
-static void simrupt_work_func(struct work_struct *w)
+static void simrupt_work_func_first(struct work_struct *w)
 {
     int val, cpu;
 
@@ -168,19 +168,55 @@ static void simrupt_work_func(struct work_struct *w)
 
         /* Store data to the kfifo buffer */
         mutex_lock(&producer_lock);
-        produce_data(val);
+        produce_data(70);
         mutex_unlock(&producer_lock);
     }
     wake_up_interruptible(&rx_wait);
 }
 
+
+static void simrupt_work_func_second(struct work_struct *w)
+{
+    int val, cpu;
+
+    /* This code runs from a kernel thread, so softirqs and hard-irqs must
+     * be enabled.
+     */
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
+    /* Pretend to simulate access to per-CPU data, disabling preemption
+     * during the pr_info().
+     */
+    cpu = get_cpu();
+    pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
+    put_cpu();
+
+    while (1) {
+        /* Consume data from the circular buffer */
+        mutex_lock(&consumer_lock);
+        val = fast_buf_get();
+        mutex_unlock(&consumer_lock);
+
+        if (val < 0)
+            break;
+
+        /* Store data to the kfifo buffer */
+        mutex_lock(&producer_lock);
+        produce_data(83);
+        mutex_unlock(&producer_lock);
+    }
+    wake_up_interruptible(&rx_wait);
+}
 /* Workqueue for asynchronous bottom-half processing */
 static struct workqueue_struct *simrupt_workqueue;
 
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
  */
-static DECLARE_WORK(work, simrupt_work_func);
+static bool switcher = true;
+static DECLARE_WORK(work, simrupt_work_func_first);
+static DECLARE_WORK(work2, simrupt_work_func_second);
 
 /* Tasklet handler.
  *
@@ -197,7 +233,15 @@ static void simrupt_tasklet_func(unsigned long __data)
     WARN_ON_ONCE(!in_softirq());
 
     tv_start = ktime_get();
-    queue_work(simrupt_workqueue, &work);
+
+    if (switcher) {
+        queue_work(simrupt_workqueue, &work);
+        switcher = !switcher;
+    } else {
+        queue_work(simrupt_workqueue, &work2);
+        switcher = !switcher;
+    }
+
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));

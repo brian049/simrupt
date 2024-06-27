@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-CPPCHECK_suppresses="--suppress=unmatchedSuppression \
+CPPCHECK_suppresses="--suppress=unmatchedSuppression:simrupt.c \
 --suppress=missingIncludeSystem -i ksort.mod.c --suppress=variableScope \
 --suppress=constParameterPointer:simrupt.c \
 --suppress=constParameterCallback:simrupt.c"
