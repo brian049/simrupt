@@ -10,6 +10,8 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "game.h"
+
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("A device that simulates interrupts");
@@ -24,6 +26,12 @@ MODULE_DESCRIPTION("A device that simulates interrupts");
 #define DEV_NAME "simrupt"
 
 #define NR_SIMRUPT 1
+
+#define BOARD_                                                          \
+    ((BOARD_SIZE * (BOARD_SIZE + 1) << 1) + (BOARD_SIZE * BOARD_SIZE) + \
+     ((BOARD_SIZE << 1) + 1))
+
+static char board_buffer[BOARD_];
 
 static int delay = 100; /* time (in ms) to generate an event */
 
@@ -58,14 +66,15 @@ static inline int update_simrupt_data(void)
 }
 
 /* Insert a value into the kfifo buffer */
-static void produce_data(unsigned char val)
+static void produce_data(void)
 {
     /* Implement a kind of circular FIFO here (skip oldest element if kfifo
      * buffer is full).
      */
-    unsigned int len = kfifo_in(&rx_fifo, &val, sizeof(val));
-    if (unlikely(len < sizeof(val)) && printk_ratelimit())
-        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(val) - len);
+    unsigned int len = kfifo_in(&rx_fifo, board_buffer, sizeof(board_buffer));
+    if (unlikely(len < sizeof(board_buffer)) && printk_ratelimit())
+        pr_warn("%s: %zu bytes dropped\n", __func__,
+                sizeof(board_buffer) - len);
 
     pr_debug("simrupt: %s: in %u/%u bytes\n", __func__, len,
              kfifo_len(&rx_fifo));
@@ -84,51 +93,84 @@ static DEFINE_MUTEX(consumer_lock);
  */
 static struct circ_buf fast_buf;
 
-static int fast_buf_get(void)
+// static int fast_buf_get(void)
+// {
+//     struct circ_buf *ring = &fast_buf;
+
+//     /* prevent the compiler from merging or refetching accesses for tail */
+//     unsigned long head = READ_ONCE(ring->head), tail = ring->tail;
+//     int ret;
+
+//     if (unlikely(!CIRC_CNT(head, tail, PAGE_SIZE)))
+//         return -ENOENT;
+
+//     /* read index before reading contents at that index */
+//     smp_rmb();
+
+//     /* extract item from the buffer */
+//     ret = ring->buf[tail];
+
+//     /* finish reading descriptor before incrementing tail */
+//     smp_mb();
+
+//     /* increment the tail pointer */
+//     ring->tail = (tail + 1) & (PAGE_SIZE - 1);
+
+//     return ret;
+// }
+
+// static int fast_buf_put(unsigned char val)
+// {
+//     struct circ_buf *ring = &fast_buf;
+//     unsigned long head = ring->head;
+
+//     /* prevent the compiler from merging or refetching accesses for tail */
+//     unsigned long tail = READ_ONCE(ring->tail);
+
+//     /* is circular buffer full? */
+//     if (unlikely(!CIRC_SPACE(head, tail, PAGE_SIZE)))
+//         return -ENOMEM;
+
+//     ring->buf[ring->head] = val;
+
+//     /* commit the item before incrementing the head */
+//     smp_wmb();
+
+//     /* update header pointer */
+//     ring->head = (ring->head + 1) & (PAGE_SIZE - 1);
+
+//     return 0;
+// }
+
+static int draw_board(int pos)
 {
-    struct circ_buf *ring = &fast_buf;
+    WRITE_ONCE(pos, pos % N_GRIDS);
+    WRITE_ONCE(pos, 2 + (pos >> 2) * 16 + ((pos & 3) << 1));
 
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long head = READ_ONCE(ring->head), tail = ring->tail;
-    int ret;
+    pr_info("%d", pos);
 
-    if (unlikely(!CIRC_CNT(head, tail, PAGE_SIZE)))
-        return -ENOENT;
-
-    /* read index before reading contents at that index */
-    smp_rmb();
-
-    /* extract item from the buffer */
-    ret = ring->buf[tail];
-
-    /* finish reading descriptor before incrementing tail */
-    smp_mb();
-
-    /* increment the tail pointer */
-    ring->tail = (tail + 1) & (PAGE_SIZE - 1);
-
-    return ret;
-}
-
-static int fast_buf_put(unsigned char val)
-{
-    struct circ_buf *ring = &fast_buf;
-    unsigned long head = ring->head;
-
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long tail = READ_ONCE(ring->tail);
-
-    /* is circular buffer full? */
-    if (unlikely(!CIRC_SPACE(head, tail, PAGE_SIZE)))
-        return -ENOMEM;
-
-    ring->buf[ring->head] = val;
-
-    /* commit the item before incrementing the head */
+    int i = 0;
+    board_buffer[i++] = '\n';
+    smp_wmb();
+    board_buffer[i++] = '\n';
     smp_wmb();
 
-    /* update header pointer */
-    ring->head = (ring->head + 1) & (PAGE_SIZE - 1);
+    while (i < BOARD_) {
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
+            board_buffer[i++] = j & 1 ? '|' : ' ';
+            smp_wmb();
+        }
+        board_buffer[i++] = '\n';
+        smp_wmb();
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
+            board_buffer[i++] = '-';
+            smp_wmb();
+        }
+        board_buffer[i++] = '\n';
+        smp_wmb();
+    }
+
+    WRITE_ONCE(board_buffer[pos], 'O');
 
     return 0;
 }
@@ -142,7 +184,7 @@ static void fast_buf_clear(void)
 /* Workqueue handler: executed by a kernel thread */
 static void simrupt_work_func_first(struct work_struct *w)
 {
-    int val, cpu;
+    int cpu;
 
     /* This code runs from a kernel thread, so softirqs and hard-irqs must
      * be enabled.
@@ -157,27 +199,18 @@ static void simrupt_work_func_first(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    while (1) {
-        /* Consume data from the circular buffer */
-        mutex_lock(&consumer_lock);
-        val = fast_buf_get();
-        mutex_unlock(&consumer_lock);
+    /* Store data to the kfifo buffer */
+    mutex_lock(&producer_lock);
+    produce_data();
+    mutex_unlock(&producer_lock);
 
-        if (val < 0)
-            break;
-
-        /* Store data to the kfifo buffer */
-        mutex_lock(&producer_lock);
-        produce_data(70);
-        mutex_unlock(&producer_lock);
-    }
     wake_up_interruptible(&rx_wait);
 }
 
 
 static void simrupt_work_func_second(struct work_struct *w)
 {
-    int val, cpu;
+    int cpu;
 
     /* This code runs from a kernel thread, so softirqs and hard-irqs must
      * be enabled.
@@ -192,20 +225,11 @@ static void simrupt_work_func_second(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    while (1) {
-        /* Consume data from the circular buffer */
-        mutex_lock(&consumer_lock);
-        val = fast_buf_get();
-        mutex_unlock(&consumer_lock);
+    /* Store data to the kfifo buffer */
+    mutex_lock(&producer_lock);
+    produce_data();
+    mutex_unlock(&producer_lock);
 
-        if (val < 0)
-            break;
-
-        /* Store data to the kfifo buffer */
-        mutex_lock(&producer_lock);
-        produce_data(83);
-        mutex_unlock(&producer_lock);
-    }
     wake_up_interruptible(&rx_wait);
 }
 /* Workqueue for asynchronous bottom-half processing */
@@ -214,7 +238,7 @@ static struct workqueue_struct *simrupt_workqueue;
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
  */
-static bool switcher = true;
+
 static DECLARE_WORK(work, simrupt_work_func_first);
 static DECLARE_WORK(work2, simrupt_work_func_second);
 
@@ -234,13 +258,9 @@ static void simrupt_tasklet_func(unsigned long __data)
 
     tv_start = ktime_get();
 
-    if (switcher) {
-        queue_work(simrupt_workqueue, &work);
-        switcher = !switcher;
-    } else {
-        queue_work(simrupt_workqueue, &work2);
-        switcher = !switcher;
-    }
+    queue_work(simrupt_workqueue, &work);
+
+    // queue_work(simrupt_workqueue, &work2);
 
     tv_end = ktime_get();
 
@@ -258,7 +278,9 @@ static void process_data(void)
     WARN_ON_ONCE(!irqs_disabled());
 
     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    fast_buf_put(update_simrupt_data());
+    mutex_lock(&producer_lock);
+    draw_board(update_simrupt_data());
+    mutex_unlock(&producer_lock);
 
     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
     tasklet_schedule(&simrupt_tasklet);
